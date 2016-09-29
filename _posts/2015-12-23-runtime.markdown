@@ -1,0 +1,662 @@
+---
+layout:     post
+title:      "深入理解Objective-C runtime"
+subtitle:   "从runtime的原理、特性到runtime的实际应用举例，最后使用runtime来构建一个ORM框架。"
+date:       2015-12-23
+author:     "waynezxcv"
+header-img: "img/post.png"
+tags:
+    - Objective-C
+    - runtime
+---
+
+
+### 目录
+
+1. [Objective-C是动态语言](#dynamic)
+2. [消息转发机制](#msg)
+3. [runtime的实际应用举例](#example)
+4. [使用rutime来构建一个ORM框架，LWAlchemy的构建思路](#lwalchemy)
+
+***
+
+
+### Objective-C是动态语言
+<p id="dynamic"></p>
+
+Objective-C是消息结构的语言而非函数调用型的语言。这两者的关键区别在与：
+
+**使用消息结构的语言，起运行时所执行的代码由运行环境决定，而使用函数调用的语言，由编译器决定.**
+如果函数调用型语言调用的函数是多态的，那么在运行时就按“虚函数表”来查处到底应该执行那个函数。而采用消息结构的语言，无论是否多态，总是在运行时采取找找需要执行的方法，编译器甚至不关心接收消息的对象是何种类型。
+
+***
+
+#### 静态绑定与动态绑定
+
+##### C语言的函数调用方式
+
+C语言使用“静态绑定”，也就是说，在编译期就能决定运行时调用的函数。编译器在编译的时候就会直接生成调用函数的指令。而函数的地址实际上是硬编码在指令之中的。
+
+```
+
+ #include <stdio.h>
+
+void printHello(){
+	printf("hello\n");
+}
+
+void printGoodByle(){
+	printf("good bye\n");
+}
+ void doSomething(int type) {
+ 	if (type == 0) {
+ 		printHello();
+ 	}
+ 	else {
+ 		printGoodByle();
+ 	}
+ }
+
+```
+但是如果将上面的代码改成下面这样,使用函数指针来调用
+
+```
+void doSomething(int type) {
+	void (*func)();
+	if (type == 0)
+	{
+		func = printHello;
+	}
+	else {
+		func = printGoodByle;
+	}
+	func();	
+}
+
+```
+这时就需要使用“动态绑定”了，因为要调用的函数直到运行期才能确定。
+
+##### OC中的方法调用方法
+在OC中，如果向对象传递消息，会使用动态绑定机制来决定需要调用的方法。在底层，所有的方法都是普通的C语言函数，然后拍对象接收到消息后，究竟调用哪个方法完全于运行期决定，甚至可以在程序运行时改变，这些特性使得**Objective-C是一门真正的动态语言。**
+
+给对象发消息可以这样来写
+
+```
+id returnValue = [someObject messageName:parameter];
+
+```
+
+其中，“someObject”叫做**接收者**，"messageName"叫做**选择子**，选择子和参数合起来叫做**消息**。编译器看到此消息会将它转换成一条标准C语言函数来调用。所调用的函数的核心函数叫做**objc_msgSend** ,它的原型如下：
+
+```
+void objc_msgSend(id self,SEL cmd,...)
+
+```
+objc_msgSend函数会根据接受者与选择子来调用适当的方法，会先在接收者的方法列表中搜寻，如果能找到与选择子名称相符的方法则调用，否则将沿着继承链继续向上查找。如果最终还是找不到，就会执行消息转发操作。
+
+动态调用速度比不上静态绑定，但这并不是性能的瓶颈所在。
+
+***
+
+
+### 消息转发机制
+<p id="msg"></p>
+
+前面说过，objc_msgSend函数会根据接受者与选择子来调用适当的方法，会先在接收者的方法列表中搜寻，如果能找到与选择子名称相符的方法则调用，否则将沿着继承链继续向上查找。如果最终还是找不到，就会执行消息转发操作。
+
+消息转发分为两大阶段。第一阶段，下征询接收者所属的类，看起是否能动态添加方法，这个阶段叫做**动态方法解析**。如果经历完了第一阶段，那么说明接收者自己就无法再以动态新增方法的手段来响应该选择子的消息了。这时启动第二阶段，第二阶段又分为两小步，此时会先请接收者看看有没有其他对象能处理这条消息，若有，则把消息转发给那个对象，这叫**备援接收者**；若没有**备援接收者**则启动**完整的消息转发机制**，运行期系统会把与消息有关的全部细节全部封装到NSInvocation对象中，再给接收者最后一次机会，另其设法解决当前还未处理的这条消息。
+
+#### 动态方法解析
+
+次阶段涉及两个方法
+
+```
+
++ (BOOL)resolveInstanceMethod:(SEL)sel;
++ (BOOL)resolveClassMethod:(SEL)sel ;
+
+
+```
+分别用来处理实例方法和类方法，来动态添加一个方法。但是前提是，那个方法的实现已经写好，只等运行的时候动态插入到类里就可以了。此方案常用来实现@dynamic属性。
+
+#### 备援接收者
+
+如果第一步的``+ (BOOL)resolveInstanceMethod:(SEL)sel;``或``+ (BOOL)resolveClassMethod:(SEL)sel ;``返回NO，说明无法动态添加方法。这是启动第二步，备援接收者。
+这一步涉及的方法
+
+🌰
+
+```
+
+- (id)forwardingTargetForSelector:(SEL)aSelector {
+    NSLog(@"执行第二步寻找备援接受者");
+    ForwaringReceiver* receiver = [[ForwaringReceiver alloc] init];
+    return receiver;
+}
+
+```
+
+#### 完整的消息转发
+
+如果第二步的``- (id)forwardingTargetForSelector:(SEL)aSelector ``方法返回nil，消息转发进入最后一步--完整的消息转发。
+
+```
+- (void)forwardInvocation:(NSInvocation *)anInvocation;
+
+
+```
+
+实现这个方法可以有两种方法：
+1. 改变调用对象。那么这将与第二步效果一模一样了。
+2. 改变消息的内容，比如追加另一个参数，或是更改选择子，等等。还应该发现若本类无法处理，就调用父类的同名方法。这样，继承体系中的每个类都有机会处理此请求，知道NSObject。
+
+如果此步还无法处理消息，将会调用“doesNotRecognizeSelector”以抛出异常。此异常表示，选择子最终未得到处理。
+
+接收者在每一步中，都有机会处理消息，步骤越往后，处理消息的代价就越大。
+最好能在第一步就处理完成，这样的话，运行时系统就可以将此方法缓存起来。如果这个类的实例，稍后还接收到相同的选择子，那么根本无须启动消息转发流程。
+若想在第三步里面把消息转给备援接收者，那还不如在第二步就转。
+
+
+***
+
+
+### runtime的实际应用举例
+<p id = "example"></p>
+
+runtime在实际项目过程中，也有不少的应用场景。这里我就总结一下我遇到的一些情况。
+
+#### 遍历类的属性，快速实现NSCoping和NSCoding协议
+
+很多时候，我们需要实现类的NSCoping和NSCoding协议。但是如果类的属性很多，重复的书写是一件很烦的事情。这时我们可以利用runtime的相关方法来简便快捷的实现NSCoping和NSCoding协议。
+
+```
+
+//** copy with zone **//
+#define LWSERIALIZE_COPY_WITH_ZONE()  \
+- (id)copyWithZone:(NSZone *)zone   \
+{   \
+NSLog(@"%s",__func__);  \
+id copy = [[[self class] allocWithZone:zone] init];    \
+Class cls = [self class];   \
+while (cls != [NSObject class]) {  \
+BOOL bIsSelfClass = (cls == [self class]);  \
+unsigned int iVarCount = 0; \
+unsigned int propVarCount = 0;  \
+unsigned int sharedVarCount = 0;    \
+Ivar *ivarList = bIsSelfClass ? class_copyIvarList([cls class], &iVarCount) : NULL; \
+objc_property_t *propList = bIsSelfClass ? NULL : class_copyPropertyList(cls, &propVarCount); \
+sharedVarCount = bIsSelfClass ? iVarCount : propVarCount;   \
+\
+for (int i = 0; i < sharedVarCount; i++) {  \
+const char *varName = bIsSelfClass ? ivar_getName(*(ivarList + i)) : property_getName(*(propList + i)); \
+NSString *key = [NSString stringWithUTF8String:varName];    \
+id varValue = [self valueForKey:key];   \
+if (varValue) { \
+[copy setValue:varValue forKey:key];    \
+}   \
+}   \
+free(ivarList); \
+free(propList); \
+cls = class_getSuperclass(cls); \
+}   \
+return copy;    \
+}
+
+
+//** coder & decoder **//
+
+ #define LWSERIALIZE_CODER_DECODER()     \
+\
+- (id)initWithCoder:(NSCoder *)coder    \
+{   \
+NSLog(@"%s",__func__);  \
+Class cls = [self class];   \
+while (cls != [NSObject class]) {   \
+BOOL bIsSelfClass = (cls == [self class]);  \
+unsigned int iVarCount = 0; \
+unsigned int propVarCount = 0;  \
+unsigned int sharedVarCount = 0;    \
+Ivar *ivarList = bIsSelfClass ? class_copyIvarList([cls class], &iVarCount) : NULL; \
+objc_property_t *propList = bIsSelfClass ? NULL : class_copyPropertyList(cls, &propVarCount);  \
+sharedVarCount = bIsSelfClass ? iVarCount : propVarCount;   \
+\
+for (int i = 0; i < sharedVarCount; i++) {  \
+const char *varName = bIsSelfClass ? ivar_getName(*(ivarList + i)) : property_getName(*(propList + i)); \
+NSString *key = [NSString stringWithUTF8String:varName];   \
+id varValue = [coder decodeObjectForKey:key];   \
+if (varValue) { \
+[self setValue:varValue forKey:key];    \
+}   \
+}   \
+free(ivarList); \
+free(propList); \
+cls = class_getSuperclass(cls); \
+}   \
+return self;    \
+}   \
+\
+- (void)encodeWithCoder:(NSCoder *)coder    \
+{   \
+NSLog(@"%s",__func__);  \
+Class cls = [self class];   \
+while (cls != [NSObject class]) {   \
+BOOL bIsSelfClass = (cls == [self class]);  \
+unsigned int iVarCount = 0; \
+unsigned int propVarCount = 0;  \
+unsigned int sharedVarCount = 0;    \
+Ivar *ivarList = bIsSelfClass ? class_copyIvarList([cls class], &iVarCount) : NULL; \
+objc_property_t *propList = bIsSelfClass ? NULL : class_copyPropertyList(cls, &propVarCount);\
+sharedVarCount = bIsSelfClass ? iVarCount : propVarCount;   \
+\
+for (int i = 0; i < sharedVarCount; i++) {  \
+const char *varName = bIsSelfClass ? ivar_getName(*(ivarList + i)) : property_getName(*(propList + i)); \
+NSString *key = [NSString stringWithUTF8String:varName];    \
+id varValue = [self valueForKey:key];   \
+if (varValue) { \
+[coder encodeObject:varValue forKey:key];   \
+}   \
+}   \
+free(ivarList); \
+free(propList); \
+cls = class_getSuperclass(cls); \
+}   \
+}
+
+
+```
+
+这样，只需要在实现协议的类里面，调用宏就OK了。
+
+***
+
+#### 为类别添加关联对象
+
+很多时候，我们需要使用类别的方式来不需要实现子类的前提下，方便的给类扩展方法。但是类别无法添加属性和成员变量，这就有很大的局限性。这是我们可以使用关联对象AssociatedObject。
+
+🌰
+
+SDWebimage中，一个使用关联对象的例：
+
+```
+
+static char loadOperationKey;
+
+- (NSMutableDictionary *)operationDictionary {
+    NSMutableDictionary *operations = objc_getAssociatedObject(self, &loadOperationKey);
+    if (operations) {
+        return operations;
+    }
+    operations = [NSMutableDictionary dictionary];
+    objc_setAssociatedObject(self, &loadOperationKey, operations, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return operations;
+}
+
+
+```
+
+但需要注意的是，设置关联对象值时，所用的key是个不透明指针。如果在NSDictionary中，两个key的isEqual：方法认为他们相同，则两个键会匹配到同一个值，**但是在设置关联对象时，若要匹配到同一个值，则两者必须使用完全相同的指针才行。这就是为什么通常设置关联对象时，通常使用静态全局变量做键。**
+
+***
+
+#### 交换方法
+
+类的方法列表会把选择子的名称映射到相关的方法实现上，使得“动态消息派发系统”能够据此找到应该调用的方法。这些方法均以函数指针的形式来表示，这种指针叫做IMP。通过类的方法列表，可以方便的给类添加新方法、交换两个方法的实现。
+
+```
+
++ (void)load {
+    [super load];
+    Method originMethod = class_getInstanceMethod([self class],NSSelectorFromString(@"o_method"));
+    
+    Method newMethod = class_getInstanceMethod([self class], NSSelectorFromString(@"n_method"));
+    
+    if (!class_addMethod([self class], @selector(n_method), method_getImplementation(newMethod), method_getTypeEncoding(newMethod))) {
+        method_exchangeImplementations(newMethod, originMethod);
+    }
+}
+
+- (void)n_method {
+	//新的方法实现...
+}
+
+
+```
+
+#### 其他应用
+
+除此之外，runtime还有通过动态绑定方法来实现@dynamic属性等。
+
+
+***
+
+### LWAlchemy的构建思路 -- 使用rutime来构建一个ORM框架
+<p id="lwalchemy"></p>
+
+[LWAlchemy](https://github.com/waynezxcv/LWAlchemy),是我编写的一个ORM框架。
+
+* 支持JSON直接生成NSObject、NSManagedObject模型，且速度极快。
+* 支持自动和自定义的映射路径。
+
+它的核心功能就是利用runtime来实现的。
+下面我就来分析一下[LWAlchemy](https://github.com/waynezxcv/LWAlchemy)的构建思路。
+
+#### LWAlchemy的主要类
+
+##### LWAlchemyPropertyInfo
+LWAlchemyPropertyInfo是对runtime下的objc_property_t的封装。它继承与NSObject主要包含下面的属性
+
+```
+@property (nonatomic,assign,readonly) objc_property_t property;//runtime中的objc_property_t
+@property (nonatomic,strong,readonly) NSString* propertyName;//属性名
+@property (nonatomic,strong,readonly) NSArray* mapperName;//映射的名字（Json字典中的key）
+@property (nonatomic,strong,readonly) NSString* ivarName;//实例变量名
+@property (nonatomic,assign,readonly) Ivar ivar;//runtiem中的实例变量的
+@property (nonatomic,assign,readonly) LWPropertyType type;//属性在CoreFoundation框架中的类型
+@property (nonatomic,assign,readonly) LWPropertyNSObjectType nsType;//属性在Foundation框架中的类型
+@property (nonatomic,copy,readonly) NSString* typeEncoding;//编码方式
+@property (nonatomic,assign,readonly) Class cls;//所属的类
+@property (nonatomic,strong,readonly) NSString* getter;//getter方法的名称（选择子名称）
+@property (nonatomic,strong,readonly) NSString* setter;//setter方法的名称（选择子名称）
+@property (nonatomic,assign,readonly,getter=isReadonly) BOOL readonly;//是不是只读属性
+@property (nonatomic,assign,readonly,getter=isDynamic) BOOL dynamic;//是不是动态类型的属性
+
+```
+
+在LWAlchemyPropertyInfo的构造函数中，我们使用了下面这个函数：
+
+```
+objc_property_attribute_t* attributes = property_copyAttributeList(property, &attrCount);
+
+```
+这个函数返回一个结构体数组。可以通过通过第二个参数遍历得到这个数组中的每一个结构体元素。
+
+这个结构体的定义如下
+
+```
+/// Defines a property attribute
+typedef struct {
+    const char *name;           /**< The name of the attribute */
+    const char *value;          /**< The value of the attribute (usually empty) */
+} objc_property_attribute_t;
+
+
+```
+
+里面包含了两个成员变量，分别是attribute的名称和值，然后遍历attributes,就可以提取到属性相关的信息。
+
+```
+  unsigned int attrCount;
+        objc_property_attribute_t* attributes = property_copyAttributeList(property, &attrCount);
+        for (unsigned int i = 0; i < attrCount; i++) {
+            switch (attributes[i].name[0]) {
+                case 'T': {
+                } break;
+                case 'V': {
+
+                } break;
+                case 'G': {
+
+                } break;
+                case 'S': {
+
+                }break;
+                case 'R': {
+                } break;
+                case 'D': {
+                } break;
+                default:break;
+            }
+        }
+
+```
+objc_property_attribute_t结构体名字字符串分别保存了该属性的相关信息。
+
+```
+* 'T':代表属性的类型。
+* 'V':代表成员变量的名称。
+* 'G':代表getter方法的选择子名称
+* 'S':代表setter方法的选择子名称
+* 'R':代表这个属性是否是readonly类型
+* 'D':代表这个属性是否是dynamic类型
+
+```
+通过遍历objc_property_attribute_t数组，我们就可以把这些信息都提取出来，并封装到LWAlchemyPropertyInfo类的属性中去，方便之后的调用。
+
+另一个关键的方法是：
+
+```
+static LWPropertyType _GetPropertyInfoType(LWAlchemyPropertyInfo* propertyInfo, const char* value) {
+    size_t len = strlen(value);
+    if (len == 0) return LWPropertyTypeUnkonw;
+    switch (* value) {
+        case 'v': {return LWPropertyTypeVoid;}
+        case 'B': {return LWPropertyTypeBool;}
+        case 'c': {return LWPropertyTypeInt8;}
+        case 'C': {return LWPropertyTypeUInt8;}
+        case 's': {return LWPropertyTypeInt16;}
+        case 'S': {return LWPropertyTypeUInt16;}
+        case 'i': {return LWPropertyTypeInt32;}
+        case 'I': {return LWPropertyTypeUInt32;}
+        case 'l': {return LWPropertyTypeInt32;}
+        case 'L': {return LWPropertyTypeUInt32;}
+        case 'q': {return LWPropertyTypeInt64;}
+        case 'Q': {return LWPropertyTypeUInt64;}
+        case 'f': {return LWPropertyTypeFloat;}
+        case 'd': {return LWPropertyTypeDouble;}
+        case 'D': {return LWPropertyTypeLongDouble;}
+        case '#': {return LWPropertyTypeClass;}
+        case ':': {return LWPropertyTypeSEL;}
+        case '*': {return LWPropertyTypeCFString;}
+        case '^': {return LWPropertyTypePointer;}
+        case '[': {return LWPropertyTypeCFArray;}
+        case '(': {return LWPropertyTypeUnion;}
+        case '{': {return LWPropertyTypeStruct;}
+        case '@': {
+            if (len == 2 && *(value + 1) == '?'){
+                return LWPropertyTypeBlock;
+            } else {
+                if (len == 1) {
+                    propertyInfo.idType = YES;
+                }
+                return LWPropertyTypeObject;
+            }
+        }
+        default:{return LWPropertyTypeUnkonw;}
+    }
+}
+
+```
+
+之前说过我们在第一步遍历objc_property_attribute_t* attributes时，'T':代表属性的类型。那么这个'T'所对应的具体值又分别代表什么呢？就可以通过``static LWPropertyType _GetPropertyInfoType(LWAlchemyPropertyInfo* propertyInfo, const char* value);``函数来获取。属性的类型使用一个定义的枚举类型来定义。
+
+```
+typedef NS_ENUM(NSUInteger, LWPropertyType) {
+    LWPropertyTypeUnkonw        = 0,
+    LWPropertyTypeVoid          = 1,
+    LWPropertyTypeBool          = 2,
+    LWPropertyTypeInt8          = 3,
+    LWPropertyTypeUInt8         = 4,
+    LWPropertyTypeInt16         = 5,
+    LWPropertyTypeUInt16        = 6,
+    LWPropertyTypeInt32         = 7,
+    LWPropertyTypeUInt32        = 8,
+    LWPropertyTypeInt64         = 9,
+    LWPropertyTypeUInt64        = 10,
+    LWPropertyTypeFloat         = 11,
+    LWPropertyTypeDouble        = 12,
+    LWPropertyTypeLongDouble    = 13,
+    LWPropertyTypeClass         = 14,
+    LWPropertyTypeSEL           = 15,
+    LWPropertyTypeCFString      = 16,
+    LWPropertyTypePointer       = 17,
+    LWPropertyTypeCFArray       = 18,
+    LWPropertyTypeUnion         = 19,
+    LWPropertyTypeStruct        = 20,
+    LWPropertyTypeObject        = 21,
+    LWPropertyTypeBlock         = 22
+};
+
+```
+这个枚举类型，就包括了在OC当中我们所使用的所有数据类型。
+这样，我们就通过构造方法，完成了对runtime中的property的封装，并通过遍历赋值到了LWAlchemyPropertyInfo的相关属性上，之后就可以很方便的使用了。
+
+##### NSObject+LWAlchemy
+
+NSObject+LWAlchemy是该框架的另一个关键类。该类是NSObject的扩展，应为iOS中所有的类的父类都是NSObject，通过这个扩展，就可以在``#import "NSObject+LWAlchemy.h"``后就可以方便的使用NSObject+LWAlchemy的方法
+
+```
++ (id)modelWithJSON:(id)json;
+
+```
+来进行属性映射了。
+
+###### + (id)modelWithJSON:(id)json;
+
+``+ (id)modelWithJSON:(id)json;``是这个扩展中最核心的一个方法，它传入一个Json字典，返回一个经过映射赋值后的对象。
+
+它的实现如下：
+
+```
+
++ (id)modelWithJSON:(id)json {
+    NSObject* model = [[self alloc] init];
+    if (model) {
+        if (![json isKindOfClass:[NSDictionary class]]) {
+            NSDictionary* dic = [model dictionaryWithJSON:json];
+            model = [model modelWithDictionary:dic];
+        }
+        else {
+            model = [model modelWithDictionary:json];
+        }
+    }
+    return model;
+}
+
+```
+首先生成一个这个类的类型的对象，然后判断传入的json是不是NSDictionary类型的对象，如果不是就通过方法、
+
+```
+- (NSDictionary *)dictionaryWithJSON:(id)json {
+    if (!json || json == (id)kCFNull) return nil;
+    NSDictionary* dic = nil;
+    NSData* jsonData = nil;
+    if ([json isKindOfClass:[NSDictionary class]]) {
+        dic = json;
+    } else if ([json isKindOfClass:[NSString class]]) {
+        jsonData = [(NSString *)json dataUsingEncoding:NSUTF8StringEncoding];
+    } else if ([json isKindOfClass:[NSData class]]) {
+        jsonData = json;
+    }
+    if (jsonData) {
+        dic = [NSJSONSerialization JSONObjectWithData:jsonData options:kNilOptions error:NULL];
+        if (![dic isKindOfClass:[NSDictionary class]]) dic = nil;
+    }
+    return dic;
+}
+
+```
+
+来将这个json转换从NSDictionary类型的对象。否则就直接通过方法：
+
+```
+- (instancetype)modelWithDictionary:(NSDictionary *)dictionary {
+    if (!dictionary || dictionary == (id)kCFNull) return nil;
+    if (![dictionary isKindOfClass:[NSDictionary class]]) return nil;
+    NSSet* propertysSet = self.class.propertysSet;
+    [propertysSet enumerateObjectsUsingBlock:^(LWAlchemyPropertyInfo* propertyInfo, BOOL * _Nonnull stop) {
+        id value = nil;
+        NSDictionary* tmp = [dictionary copy];
+        for (NSInteger i = 0; i < propertyInfo.mapperName.count; i ++) {
+            NSString* mapperName = propertyInfo.mapperName[i];
+            value = tmp[mapperName];
+            if ([value isKindOfClass:[NSDictionary class]]) {
+                tmp = value;
+            }
+        }
+        if (value != nil && ![value isEqual:[NSNull null]]) {
+            _SetPropertyValue(self,propertyInfo,value);
+        }
+    }];
+    return self;
+}
+
+
+```
+开始执行模型映射。其中propertysSet是NSObject+LWAlchemy的一个关联对象，用来**缓存这个类的属性列表，实现只在第一次使用的时候遍历类的属性列表，再次使用时直接读取缓存数据，提高转换的性能。**
+
+```
++ (NSSet *)propertysSet {
+    NSSet* cachedKeys = objc_getAssociatedObject(self, LWAlechmyCachedPropertyKeysKey);
+    if (cachedKeys != nil) {
+        return cachedKeys;
+    }
+    NSMutableSet* propertysSet = [NSMutableSet set];
+    [self _enumeratePropertiesUsingBlock:^(objc_property_t property, BOOL *stop) {
+        LWAlchemyPropertyInfo* propertyInfo = [[LWAlchemyPropertyInfo alloc] initWithProperty:property customMapper:[self mapper]];
+        if (propertyInfo.propertyName && !propertyInfo.isReadonly) {
+            [propertysSet addObject:propertyInfo];
+        }
+    }];
+    objc_setAssociatedObject(self,LWAlechmyCachedPropertyKeysKey, propertysSet, OBJC_ASSOCIATION_COPY);
+    return propertysSet;
+}
+
+```
+
+propertysSet中缓存的就是经过LWAlchemyPropertyInfo封装的对象。然后遍历propertySet来进行模型映射。
+
+```
+    NSSet* propertysSet = self.class.propertysSet;
+    [propertysSet enumerateObjectsUsingBlock:^(LWAlchemyPropertyInfo* propertyInfo, BOOL * _Nonnull stop) {
+        id value = nil;
+        NSDictionary* tmp = [dictionary copy];
+        for (NSInteger i = 0; i < propertyInfo.mapperName.count; i ++) {
+            NSString* mapperName = propertyInfo.mapperName[i];
+            value = tmp[mapperName];
+            if ([value isKindOfClass:[NSDictionary class]]) {
+                tmp = value;
+            }
+        }
+        if (value != nil && ![value isEqual:[NSNull null]]) {
+            _SetPropertyValue(self,propertyInfo,value);
+        }
+    }];
+
+```
+
+执行映射赋值的过程是：
+
+1. 先区分属性的具体类型LWPropertyType。
+2. 从封装的LWAlchemyPropertyInfo对象中提取setter属性，这是一个字符串类型的属性，它的值就是setter方法的选择子名称。
+3. 通过objc_msgSend的函数指针进行赋值。
+
+```
+    SEL setterSelector = NSSelectorFromString(propertyInfo.setter);
+
+```
+
+这个函数来创建选择子。
+
+
+```
+            NSString* string = [NSString stringWithFormat:@"%@",(NSString *)value];
+            void (*objc_msgSendToSetter)(id, SEL,NSString*) = (void*)objc_msgSend;
+            objc_msgSendToSetter((id)model, setterSelector, string);
+```
+
+然后通过函数指针调用objc_msgSend函数，并把需要赋值的对象作为第一个参数，这个setter方法选择子作为第二个参数，需要赋值的值作为第三个参数，传入完成objc_msgSend函数赋值工作。
+
+这里使用objc_msgSend函数指针来调用，而不直接使用KVO的``setValue：forKey：``方法，是因为objc_msgSend是更底层的C语言API，它的速度比``setValue：forKey：``更快，而且一些基础类型的属性，无法使用KVO来赋值。再结合之前的缓存机制，所以**使用LWAlchemy来进行模型映射，比其他ORM框架速度更快。**
+
+LWAlchemy的大体思路就是这样了，它还包括了CoreData的一些封装，可以在多线程中方便的使用，这里就不详细阐述了。
+
+
+***
+
+### 参考
+
+《Effective Ojbective-C 2.0》
+
+《Objective-C高级编程》
+
+
