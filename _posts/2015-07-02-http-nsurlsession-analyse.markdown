@@ -1,6 +1,6 @@
 ---
 layout:     post
-title:      "iOS网络请求大型攻略 -- HTTP协议、NSURLSession、AFNetworking"
+title:      "HTTP协议、NSURLSession、AFNetworking"
 subtitle:   "从HTTP原理到NSURLSession的原理和使用再到开源框架AFNetworking的源代码分析。"
 date:       2015-07-02
 author:     "waynezxcv"
