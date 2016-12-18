@@ -15,7 +15,7 @@ tags:
 
 ### Mac版本下载地址
 
-[Puppeteer for Mac] (http://waynezxcv.oss-cn-shenzhen.aliyuncs.com/Puppeteer_for_Mac.dmg)
+[Puppeteer for Mac](http://waynezxcv.oss-cn-shenzhen.aliyuncs.com/Puppeteer_for_Mac.dmg)
 
 
 ***
