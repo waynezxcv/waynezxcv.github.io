@@ -10,8 +10,20 @@ tags:
     - iOS
 ---
 
-### 目录
 
+
+
+### Mac版本下载地址
+
+[Puppeteer for Mac] (http://waynezxcv.oss-cn-shenzhen.aliyuncs.com/Puppeteer_for_Mac.dmg)
+
+
+***
+
+
+### Windows版本下载地址
+
+# 敬请期待...
 
 
 ***
